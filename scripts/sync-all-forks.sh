@@ -26,14 +26,14 @@ echo "Authenticated as: $USER"
 LIMIT=1000
 
 echo "Listing forks for $USER..."
-repos_json=$(gh repo list "$USER" --limit "$LIMIT" --json name,cloneUrl,isFork,parent,defaultBranchRef) || {
+repos_json=$(gh repo list "$USER" --limit "$LIMIT" --json name,url,sshUrl,isFork,parent,defaultBranchRef) || {
   echo "Failed to list repos via gh. Exiting."; exit 1;
 }
 
 count=0
 
 # Iterate over forks
-echo "$repos_json" | jq -c '.[] | select(.isFork) | {name: .name, clone: .cloneUrl, parent_full:.parent.full_name, parent_clone:.parent.cloneUrl, branch:.defaultBranchRef.name }' \
+echo "$repos_json" | jq -c '.[] | select(.isFork) | {name: .name, clone: .url, ssh: .sshUrl, parent_full:.parent.nameWithOwner, parent_clone:.parent.url, branch:.defaultBranchRef.name }' \
 | while read -r repo; do
   name=$(jq -r .name <<<"$repo")
   clone=$(jq -r .clone <<<"$repo")
