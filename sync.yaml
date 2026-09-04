@@ -1,0 +1,53 @@
+name: Sync all forks (account-wide)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'Set to "apply" to actually push merges; default is dry-run'
+        required: false
+        default: 'dry-run'
+  schedule:
+    - cron: '0 3 * * *' # daily at 03:00 UTC (optional)
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq git curl ca-certificates
+          # install gh CLI
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      - name: Authenticate gh with PAT
+        env:
+          PERSONAL_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+        run: |
+          if [ -z "$PERSONAL_TOKEN" ]; then
+            echo "PERSONAL_TOKEN secret is not set. Aborting."
+            exit 1
+          fi
+          echo "$PERSONAL_TOKEN" | gh auth login --with-token
+
+      - name: Make script executable
+        run: chmod +x scripts/sync-all-forks.sh
+
+      - name: Run sync (dry-run unless run=apply)
+        env:
+          MAX_REPOS: 0 # change to batch-size as needed to avoid timeouts
+        run: |
+          if [ "${{ github.event.inputs.run }}" = "apply" ]; then
+            ./scripts/sync-all-forks.sh
+          else
+            ./scripts/sync-all-forks.sh --dry-run
+          fi
