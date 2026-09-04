@@ -1,53 +1,101 @@
-name: Sync all forks (account-wide)
+#!/usr/bin/env bash
+set -euo pipefail
 
-on:
-  workflow_dispatch:
-    inputs:
-      run:
-        description: 'Set to "apply" to actually push merges; default is dry-run'
-        required: false
-        default: 'dry-run'
-  schedule:
-    - cron: '0 3 * * *' # daily at 03:00 UTC (optional)
+# Sync all forks owned by the authenticated user with their upstream parents.
+# Usage:
+#   ./sync-all-forks.sh           # actually perform sync (when run locally or in Actions with PAT)
+#   ./sync-all-forks.sh --dry-run # only list what would run
+#
+# Environment:
+#   MAX_REPOS - optional limit on how many repos to process in one run (0 = no limit)
+#
+# Requirements (for local runs):
+#   - gh (GitHub CLI) authenticated (gh auth login OR gh auth login --with-token)
+#   - git
+#   - jq
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq git curl ca-certificates
-          # install gh CLI
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-            | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y gh
+MAX_REPOS=${MAX_REPOS:-0}
 
-      - name: Authenticate gh with PAT
-        env:
-          PERSONAL_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
-        run: |
-          if [ -z "$PERSONAL_TOKEN" ]; then
-            echo "PERSONAL_TOKEN secret is not set. Aborting."
-            exit 1
-          fi
-          echo "$PERSONAL_TOKEN" | gh auth login --with-token
+echo "Checking gh authentication..."
+USER=$(gh api user --jq .login) || { echo "gh not authenticated. Run: gh auth login"; exit 1; }
+echo "Authenticated as: $USER"
 
-      - name: Make script executable
-        run: chmod +x scripts/sync-all-forks.sh
+LIMIT=1000
 
-      - name: Run sync (dry-run unless run=apply)
-        env:
-          MAX_REPOS: 0 # change to batch-size as needed to avoid timeouts
-        run: |
-          if [ "${{ github.event.inputs.run }}" = "apply" ]; then
-            ./scripts/sync-all-forks.sh
-          else
-            ./scripts/sync-all-forks.sh --dry-run
-          fi
+echo "Listing forks for $USER..."
+repos_json=$(gh repo list "$USER" --limit "$LIMIT" --json name,url,sshUrl,isFork,parent,defaultBranchRef) || {
+  echo "Failed to list repos via gh. Exiting."; exit 1;
+}
+
+count=0
+
+# Iterate over forks
+echo "$repos_json" | jq -c '.[] | select(.isFork) | {name: .name, clone: .url, ssh: .sshUrl, parent_full:.parent.full_name, parent_clone:.parent.url, branch:.defaultBranchRef.name }' \
+| while read -r repo; do
+  name=$(jq -r .name <<<"$repo")
+  clone=$(jq -r .clone <<<"$repo")
+  parent_clone=$(jq -r .parent_clone <<<"$repo")
+  branch=$(jq -r .branch <<<"$repo")
+
+  count=$((count+1))
+  if [ "$MAX_REPOS" -ne 0 ] && [ "$count" -gt "$MAX_REPOS" ]; then
+    echo "Reached MAX_REPOS ($MAX_REPOS). Stopping."
+    break
+  fi
+
+  echo
+  echo "==== $name (branch: $branch) ===="
+  echo "Fork clone URL: $clone"
+  echo "Upstream clone URL: $parent_clone"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "(dry-run) skipping actual clone/merge"
+    continue
+  fi
+
+  tmp=$(mktemp -d)
+  echo "Cloning $name (branch $branch)..."
+  if ! git clone --depth=1 --branch "$branch" "$clone" "$tmp/$name"; then
+    echo "  Failed to clone $clone. Skipping."
+    rm -rf "$tmp"
+    continue
+  fi
+
+  pushd "$tmp/$name" >/dev/null
+  git remote add upstream "$parent_clone" || true
+  echo "  Fetching upstream/$branch..."
+  if ! git fetch upstream "$branch" --depth=1; then
+    echo "  Failed to fetch upstream branch. Skipping."
+    popd >/dev/null
+    rm -rf "$tmp"
+    continue
+  fi
+
+  git checkout "$branch"
+
+  echo "  Attempting fast-forward merge from upstream/$branch..."
+  if git merge --ff-only "upstream/$branch"; then
+    echo "  Fast-forwarded."
+    git push origin "$branch"
+    echo "  Pushed to origin/$branch."
+  else
+    echo "  Not fast-forwardable; attempting regular merge (may create merge commit)."
+    if git merge --no-edit "upstream/$branch"; then
+      git push origin "$branch"
+      echo "  Merged and pushed."
+    else
+      echo "  Merge produced conflicts. Aborting merge and skipping $name."
+      git merge --abort || true
+      # Optionally: create a PR for manual resolution. Skipping for safety.
+    fi
+  fi
+
+  popd >/dev/null
+  rm -rf "$tmp"
+done
+
+echo
+echo "Done."
